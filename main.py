@@ -38,6 +38,13 @@ def init_db():
         )
     ''')
 
+    # Добавляем столбец run_id если его нет (миграция)
+    try:
+        cursor.execute('SELECT run_id FROM answers LIMIT 1')
+    except sqlite3.OperationalError:
+        cursor.execute('ALTER TABLE answers ADD COLUMN run_id INTEGER DEFAULT 1')
+        logger.info("Added run_id column to answers table")
+
     conn.commit()
     conn.close()
 
