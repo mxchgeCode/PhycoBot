@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "phycobot"
+version = "0.1.0"
+description = "Telegram Bot for Phyco"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+python-telegram-bot = "^20.8"
+
+[tool.poetry.scripts]
+phycobot = "main:main"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
