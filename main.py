@@ -1,7 +1,6 @@
 import logging
 import os
 import sqlite3
-from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, PollAnswerHandler, CallbackQueryHandler, ContextTypes
 
@@ -38,6 +37,14 @@ def init_db():
         )
     ''')
 
+    # Таблица прогресса пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_progress (
+            user_id INTEGER PRIMARY KEY,
+            current_poll_index INTEGER DEFAULT 0
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -60,21 +67,39 @@ def get_polls():
     return polls
 
 
-def get_poll_by_id(poll_id):
-    """Получить опрос по ID"""
+def get_user_progress(user_id: int) -> int:
+    """Получить текущий индекс опроса для пользователя"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT id, question, options FROM polls WHERE id = ?', (poll_id,))
+    cursor.execute('SELECT current_poll_index FROM user_progress WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     conn.close()
+    return row[0] if row else 0
 
-    if row:
-        return {
-            "id": row[0],
-            "question": row[1],
-            "options": row[2].split("|||")
-        }
-    return None
+
+def save_user_progress(user_id: int, poll_index: int):
+    """Сохранить прогресс пользователя"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT OR REPLACE INTO user_progress (user_id, current_poll_index) VALUES (?, ?)',
+        (user_id, poll_index)
+    )
+    conn.commit()
+    conn.close()
+
+
+def user_has_voted_in_poll(poll_id: int, user_id: int) -> bool:
+    """Проверить, голосовал ли пользователь в конкретном опросе"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT id FROM answers WHERE poll_id = ? AND user_id = ?',
+        (poll_id, user_id)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
 
 
 def save_answer(poll_id: int, user_id: int, option_index: int):
@@ -87,19 +112,6 @@ def save_answer(poll_id: int, user_id: int, option_index: int):
     )
     conn.commit()
     conn.close()
-
-
-def user_has_voted(poll_id: int, user_id: int) -> bool:
-    """Проверить, голосовал ли пользователь в этом опросе"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT id FROM answers WHERE poll_id = ? AND user_id = ?',
-        (poll_id, user_id)
-    )
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
 
 
 def get_poll_stats(poll_id: int) -> dict:
@@ -124,22 +136,24 @@ poll_id_mapping = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запуск первого опроса при команде /start"""
+    """Запуск опроса с текущего прогресса пользователя"""
     user_id = update.message.from_user.id
 
-    # Получаем первый опрос из БД
     polls = get_polls()
     if not polls:
         await update.message.reply_text("Опросы не найдены в базе данных")
         return
 
+    # Получаем прогресс пользователя
+    current_index = get_user_progress(user_id)
+
     # Сохраняем список опросов в контексте
     context.user_data['polls'] = polls
-    context.user_data['current_poll_index'] = 0
 
-    # Запускаем первый опрос
-    await send_poll(update.message.chat_id, 0, context.bot, polls)
-    logger.info(f"User {user_id} started polls")
+    logger.info(f"User {user_id} started polls from index {current_index}")
+
+    # Запускаем опрос с текущего индекса
+    await send_poll(update.message.chat_id, current_index, context.bot, polls)
 
 
 async def send_poll(chat_id: int, poll_index: int, bot, polls: list) -> None:
@@ -187,21 +201,22 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     db_id = poll_info["db_id"]
     poll_index = poll_info["index"]
 
-    # Проверяем, голосовал ли уже пользователь
-    if user_has_voted(db_id, user_id):
+    # Проверяем, голосовал ли уже пользователь в этом опросе
+    if user_has_voted_in_poll(db_id, user_id):
         logger.info(f"User {user_id} already voted on poll {db_id}")
-        return
-
-    # Сохраняем ответ в БД
-    for option in poll_answer.option_ids:
-        save_answer(db_id, user_id, option)
-
-    logger.info(f"User {user_id} voted on poll {db_id}, options {poll_answer.option_ids}")
+        # Всё равно показываем следующий опрос
+    else:
+        # Сохраняем ответ в БД
+        for option in poll_answer.option_ids:
+            save_answer(db_id, user_id, option)
+        logger.info(f"User {user_id} voted on poll {db_id}, options {poll_answer.option_ids}")
 
     # Переходим к следующему опросу
     polls = context.user_data.get('polls', [])
     next_index = poll_index + 1
-    context.user_data['current_poll_index'] = next_index
+
+    # Сохраняем прогресс пользователя
+    save_user_progress(user_id, next_index)
 
     chat_id = update.poll_answer.user.id
     await send_poll(chat_id, next_index, context.bot, polls)
@@ -258,7 +273,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def add_poll(question: str, options: list, poll_type: str = 'general'):
-    """Добавить опрос в БД (для админки или миграций)"""
+    """Добавить опрос в БД"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
@@ -268,6 +283,16 @@ def add_poll(question: str, options: list, poll_type: str = 'general'):
     conn.commit()
     conn.close()
     logger.info(f"Added poll: {question}")
+
+
+def reset_user_progress(user_id: int):
+    """Сбросить прогресс пользователя (для тестирования)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM user_progress WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM answers WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 
 
 def main():
