@@ -1,7 +1,12 @@
 import logging
 import os
+import signal
 import sqlite3
+import sys
+
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, PollAnswerHandler, CallbackQueryHandler, ContextTypes
 
 # Включаем логирование
@@ -113,6 +118,17 @@ def get_poll_stats(poll_id: int) -> dict:
 poll_id_mapping = {}
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors: log Conflict briefly, others with traceback."""
+    if isinstance(context.error, Conflict):
+        logger.warning(
+            "Conflict: another bot instance is polling (getUpdates). "
+            "Stop other runs of this bot or wait for them to exit."
+        )
+        return
+    logger.exception("Update %s caused error: %s", update, context.error)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запуск опросов с первого вопроса (всегда)"""
     user_id = update.message.from_user.id
@@ -142,12 +158,10 @@ async def send_poll(chat_id: int, poll_index: int, bot, polls: list) -> None:
     """Отправляет опрос по индексу"""
     if poll_index >= len(polls):
         # Все опросы пройдены
-        keyboard = [[InlineKeyboardButton("📊 Статистика", callback_data='stats')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         await bot.send_message(
             chat_id=chat_id,
             text="Опрос пройден успешно!",
-            reply_markup=reply_markup
+            reply_markup=keyboard_finish()
         )
         return
 
@@ -201,25 +215,24 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать статистику всех опросов (все прохождения)"""
+    text = get_stats_text()
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard_stats())
+
+
+async def restart_survey(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
+    """Перезапуск опроса с первого вопроса (как /start)."""
     polls = get_polls()
+    if not polls:
+        await bot.send_message(chat_id=chat_id, text="Опросы не найдены в базе данных")
+        return
 
-    text = "📊 **Статистика опросов**\n\n"
+    run_id = get_user_runs(user_id)
+    context.user_data['polls'] = polls
+    context.user_data['run_id'] = run_id
+    context.user_data['current_poll_index'] = 0
 
-    for i, poll_data in enumerate(polls):
-        stats = get_poll_stats(poll_data["id"])
-        text += f"**{i+1}. {poll_data['question']}**\n"
-        text += "| Вариант | Голосов |\n"
-        text += "|---------|---------|\n"
-
-        total_votes = 0
-        for j, option in enumerate(poll_data["options"]):
-            count = stats.get(j, 0)
-            total_votes += count
-            text += f"| {option} | {count} |\n"
-
-        text += f"**Всего голосов: {total_votes}**\n\n"
-
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await bot.send_message(chat_id=chat_id, text=f"Прохождение #{run_id}. Начинаем!")
+    await send_poll(chat_id, 0, bot, polls)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -227,26 +240,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
 
+    if query.data == 'restart':
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+        await restart_survey(chat_id, user_id, context, context.bot)
+        return
+
     if query.data == 'stats':
-        polls = get_polls()
+        await query.edit_message_text(text=get_stats_text(), parse_mode='Markdown', reply_markup=keyboard_stats())
+        return
 
-        text = "📊 **Статистика опросов**\n\n"
+    # Запрос подтверждения сброса (от экрана завершения или от статистики)
+    if query.data == 'reset_ask_finish':
+        confirm_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Да", callback_data='reset_yes'), InlineKeyboardButton("Нет", callback_data='reset_no_finish')],
+        ])
+        await query.edit_message_text(
+            text="Вы уверены? Это действие удалит данные статистики.",
+            reply_markup=confirm_markup
+        )
+        return
+    if query.data == 'reset_ask_stats':
+        confirm_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Да", callback_data='reset_yes'), InlineKeyboardButton("Нет", callback_data='reset_no_stats')],
+        ])
+        await query.edit_message_text(
+            text="Вы уверены? Это действие удалит данные статистики.",
+            reply_markup=confirm_markup
+        )
+        return
 
-        for i, poll_data in enumerate(polls):
-            stats = get_poll_stats(poll_data["id"])
-            text += f"**{i+1}. {poll_data['question']}**\n"
-            text += "| Вариант | Голосов |\n"
-            text += "|---------|---------|\n"
-
-            total_votes = 0
-            for j, option in enumerate(poll_data["options"]):
-                count = stats.get(j, 0)
-                total_votes += count
-                text += f"| {option} | {count} |\n"
-
-            text += f"**Всего голосов: {total_votes}**\n\n"
-
-        await query.edit_message_text(text=text, parse_mode='Markdown')
+    if query.data == 'reset_yes':
+        clear_all_answers()
+        await query.edit_message_text(text="Данные сброшены.", reply_markup=keyboard_finish())
+        return
+    if query.data == 'reset_no_finish':
+        await query.edit_message_text(text="Опрос пройден успешно!", reply_markup=keyboard_finish())
+        return
+    if query.data == 'reset_no_stats':
+        await query.edit_message_text(text=get_stats_text(), parse_mode='Markdown', reply_markup=keyboard_stats())
+        return
 
 
 def add_poll(question: str, options: list, poll_type: str = 'general'):
@@ -271,6 +304,41 @@ def clear_all_answers():
     conn.close()
 
 
+def get_stats_text() -> str:
+    """Сформировать текст статистики опросов."""
+    polls = get_polls()
+    text = "📊 **Статистика опросов**\n\n"
+    for i, poll_data in enumerate(polls):
+        stats = get_poll_stats(poll_data["id"])
+        text += f"**{i+1}. {poll_data['question']}**\n"
+        text += "| Вариант | Голосов |\n"
+        text += "|---------|--------|\n"
+        total_votes = 0
+        for j, option in enumerate(poll_data["options"]):
+            count = stats.get(j, 0)
+            total_votes += count
+            text += f"| {option} | {count} |\n"
+        text += f"**Всего голосов: {total_votes}**\n\n"
+    return text
+
+
+def keyboard_finish():
+    """Клавиатура после завершения опроса."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Запустить снова", callback_data='restart')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='stats')],
+        [InlineKeyboardButton("🗑 Сброс данных", callback_data='reset_ask_finish')],
+    ])
+
+
+def keyboard_stats():
+    """Клавиатура под сообщением со статистикой."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Запустить снова", callback_data='restart')],
+        [InlineKeyboardButton("🗑 Сброс данных", callback_data='reset_ask_stats')],
+    ])
+
+
 def main():
     # Инициализируем БД
     init_db()
@@ -282,6 +350,7 @@ def main():
         add_poll("Как вы оцениваете сервис?", ["Отлично", "Хорошо", "Удовлетворительно", "Плохо"])
         logger.info("Created default polls")
 
+    load_dotenv()
     TOKEN = os.getenv('BOT_TOKEN')
 
     app = Application.builder().token(TOKEN).build()
@@ -290,7 +359,14 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(PollAnswerHandler(handle_poll_answer))
+    app.add_error_handler(error_handler)
 
+    def signal_handler(sig, frame):
+        print('\nОстановка бота...')
+        app.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
