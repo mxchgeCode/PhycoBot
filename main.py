@@ -346,9 +346,7 @@ def main():
     # Если опросов нет, добавляем примеры
     polls = get_polls()
     if not polls:
-        add_poll("Какая ваша любимая еда?", ["Пицца", "Суши", "Бургеры", "Салат"])
-        add_poll("Как вы оцениваете сервис?", ["Отлично", "Хорошо", "Удовлетворительно", "Плохо"])
-        logger.info("Created default polls")
+        logger.info("no polls")
 
     load_dotenv()
     TOKEN = os.getenv('BOT_TOKEN')
