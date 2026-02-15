@@ -1,4 +1,3 @@
-import logging
 import os
 import signal
 import sqlite3
@@ -8,10 +7,6 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, PollAnswerHandler, CallbackQueryHandler, ContextTypes
-
-# Включаем логирование
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 DB_PATH = "bot.db"
 
@@ -42,13 +37,6 @@ def init_db():
             FOREIGN KEY (poll_id) REFERENCES polls(id)
         )
     ''')
-
-    # Добавляем столбец run_id если его нет (миграция)
-    try:
-        cursor.execute('SELECT run_id FROM answers LIMIT 1')
-    except sqlite3.OperationalError:
-        cursor.execute('ALTER TABLE answers ADD COLUMN run_id INTEGER DEFAULT 1')
-        logger.info("Added run_id column to answers table")
 
     conn.commit()
     conn.close()
@@ -121,16 +109,19 @@ poll_id_mapping = {}
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors: log Conflict briefly, others with traceback."""
     if isinstance(context.error, Conflict):
-        logger.warning(
+        print(
             "Conflict: another bot instance is polling (getUpdates). "
             "Stop other runs of this bot or wait for them to exit."
         )
         return
-    logger.exception("Update %s caused error: %s", update, context.error)
+    print(f"Update {update} caused error: {context.error}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запуск опросов с первого вопроса (всегда)"""
+    if update.message is None or update.message.from_user is None:
+        return
+    
     user_id = update.message.from_user.id
 
     polls = get_polls()
@@ -142,13 +133,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     run_id = get_user_runs(user_id)
 
     # Сохраняем контекст
-    context.user_data['polls'] = polls
-    context.user_data['run_id'] = run_id
-    context.user_data['current_poll_index'] = 0
+    user_data = context.user_data
+    if user_data is not None:
+        user_data['polls'] = polls
+        user_data['run_id'] = run_id
+        user_data['current_poll_index'] = 0
 
     await update.message.reply_text(f"Прохождение #{run_id}. Начинаем!")
-
-    logger.info(f"User {user_id} started run #{run_id} from first poll")
 
     # Запускаем первый опрос
     await send_poll(update.message.chat_id, 0, context.bot, polls)
@@ -180,41 +171,51 @@ async def send_poll(chat_id: int, poll_index: int, bot, polls: list) -> None:
         "index": poll_index
     }
 
-    logger.info(f"Sent poll {poll_index}: {poll_data['question']}")
-
 
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает ответы на опросы"""
     poll_answer = update.poll_answer
+    if poll_answer is None or poll_answer.user is None:
+        return
+    
     real_poll_id = poll_answer.poll_id
     user_id = poll_answer.user.id
 
     poll_info = poll_id_mapping.get(real_poll_id)
     if poll_info is None:
-        logger.warning(f"Unknown poll_id: {real_poll_id}")
         return
 
-    db_id = poll_info["db_id"]
-    poll_index = poll_info["index"]
-    run_id = context.user_data.get('run_id', 1)
+    db_id = poll_info.get("db_id")
+    poll_index = poll_info.get("index")
+    if db_id is None or poll_index is None:
+        return
+    
+    user_data = context.user_data
+    run_id = 1
+    if user_data is not None:
+        run_id = user_data.get('run_id', 1)
 
     # Сохраняем ответ в БД
-    for option in poll_answer.option_ids:
-        save_answer(db_id, user_id, option, run_id)
-
-    logger.info(f"User {user_id} voted on poll {db_id}, run #{run_id}")
+    if poll_answer.option_ids is not None:
+        for option in poll_answer.option_ids:
+            save_answer(db_id, user_id, option, run_id)
 
     # Переходим к следующему опросу
-    polls = context.user_data.get('polls', [])
+    polls = []
+    if user_data is not None:
+        polls = user_data.get('polls', [])
     next_index = poll_index + 1
-    context.user_data['current_poll_index'] = next_index
+    if user_data is not None:
+        user_data['current_poll_index'] = next_index
 
-    chat_id = update.poll_answer.user.id
+    chat_id = user_id
     await send_poll(chat_id, next_index, context.bot, polls)
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def stats_command(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать статистику всех опросов (все прохождения)"""
+    if update.message is None:
+        return
     text = get_stats_text()
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=keyboard_stats())
 
@@ -227,9 +228,11 @@ async def restart_survey(chat_id: int, user_id: int, context: ContextTypes.DEFAU
         return
 
     run_id = get_user_runs(user_id)
-    context.user_data['polls'] = polls
-    context.user_data['run_id'] = run_id
-    context.user_data['current_poll_index'] = 0
+    user_data = context.user_data
+    if user_data is not None:
+        user_data['polls'] = polls
+        user_data['run_id'] = run_id
+        user_data['current_poll_index'] = 0
 
     await bot.send_message(chat_id=chat_id, text=f"Прохождение #{run_id}. Начинаем!")
     await send_poll(chat_id, 0, bot, polls)
@@ -238,6 +241,9 @@ async def restart_survey(chat_id: int, user_id: int, context: ContextTypes.DEFAU
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает нажатия на кнопки"""
     query = update.callback_query
+    if query is None or query.from_user is None or query.message is None:
+        return
+    
     await query.answer()
 
     if query.data == 'restart':
@@ -251,18 +257,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # Запрос подтверждения сброса (от экрана завершения или от статистики)
-    if query.data == 'reset_ask_finish':
+    if query.data in ('reset_ask_finish', 'reset_ask_stats'):
+        no_callback = 'reset_no_finish' if query.data == 'reset_ask_finish' else 'reset_no_stats'
         confirm_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Да", callback_data='reset_yes'), InlineKeyboardButton("Нет", callback_data='reset_no_finish')],
-        ])
-        await query.edit_message_text(
-            text="Вы уверены? Это действие удалит данные статистики.",
-            reply_markup=confirm_markup
-        )
-        return
-    if query.data == 'reset_ask_stats':
-        confirm_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Да", callback_data='reset_yes'), InlineKeyboardButton("Нет", callback_data='reset_no_stats')],
+            [InlineKeyboardButton("Да", callback_data='reset_yes'), InlineKeyboardButton("Нет", callback_data=no_callback)],
         ])
         await query.edit_message_text(
             text="Вы уверены? Это действие удалит данные статистики.",
@@ -279,7 +277,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if query.data == 'reset_no_stats':
         await query.edit_message_text(text=get_stats_text(), parse_mode='Markdown', reply_markup=keyboard_stats())
-        return
 
 
 def add_poll(question: str, options: list, poll_type: str = 'general'):
@@ -292,7 +289,6 @@ def add_poll(question: str, options: list, poll_type: str = 'general'):
     )
     conn.commit()
     conn.close()
-    logger.info(f"Added poll: {question}")
 
 
 def clear_all_answers():
@@ -343,15 +339,10 @@ def main():
     # Инициализируем БД
     init_db()
 
-    # Если опросов нет, добавляем примеры
-    polls = get_polls()
-    if not polls:
-        logger.info("no polls")
-
     load_dotenv()
-    TOKEN = os.getenv('BOT_TOKEN')
+    token = os.getenv('BOT_TOKEN')
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_command))
@@ -359,7 +350,7 @@ def main():
     app.add_handler(PollAnswerHandler(handle_poll_answer))
     app.add_error_handler(error_handler)
 
-    def signal_handler(sig, frame):
+    def signal_handler(_sig, _frame):
         print('\nОстановка бота...')
         app.stop()
         sys.exit(0)
