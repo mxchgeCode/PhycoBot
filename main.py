@@ -242,7 +242,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if query.data == 'restart':
         user_id = query.from_user.id
-        chat_id = query.message.chat_id
+        chat_id = query.message.chat.id
         await restart_survey(chat_id, user_id, context, context.bot)
         return
 
