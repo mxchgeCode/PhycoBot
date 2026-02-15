@@ -103,7 +103,7 @@ def get_poll_stats(poll_id: int) -> dict:
 
 
 # Маппинг реальных poll_id от Telegram к нашим ID
-poll_id_mapping = {}
+poll_id_mapping: dict[str, dict[str, int]] = {}
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -185,10 +185,8 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if poll_info is None:
         return
 
-    db_id = poll_info.get("db_id")
-    poll_index = poll_info.get("index")
-    if db_id is None or poll_index is None:
-        return
+    db_id = poll_info["db_id"]
+    poll_index = poll_info["index"]
     
     user_data = context.user_data
     run_id = 1
